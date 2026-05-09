@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"log"
+	"net/url"
 
 	"github.com/gofiber/fiber/v2"
 	fiberws "github.com/gofiber/websocket/v2"
@@ -111,7 +112,10 @@ type wsIncomingMsg struct {
 // HandleWebSocket manages a single WebSocket connection for the given room/player.
 func (h *Handler) HandleWebSocket(c *fiberws.Conn) {
 	code := c.Params("code")
-	name := c.Params("name")
+	name, err := url.PathUnescape(c.Params("name"))
+	if err != nil {
+		name = c.Params("name")
+	}
 
 	client := &Client{
 		conn:     c,

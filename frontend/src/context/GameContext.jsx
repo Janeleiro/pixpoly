@@ -4,6 +4,7 @@ const GameContext = createContext(null)
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000'
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3000'
+export const DISCONNECTED_MESSAGE = 'Conexão perdida com o servidor.'
 
 const SESSION_KEY = 'pixpoly_session'
 
@@ -28,6 +29,7 @@ export function GameProvider({ children }) {
   const [room, setRoom] = useState(null)
   const [player, setPlayer] = useState(null)
   const [wsError, setWsError] = useState(null)
+  const [isDisconnected, setIsDisconnected] = useState(false)
   const wsRef = useRef(null)
   const pendingActionsRef = useRef(new Map())
 
@@ -45,6 +47,8 @@ export function GameProvider({ children }) {
       wsRef.current = null
       rejectPendingActions('Conexão encerrada.')
     }
+
+    setIsDisconnected(false)
 
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(`${WS_URL}/ws/${roomCode}/${encodeURIComponent(playerName)}`)
@@ -76,6 +80,7 @@ export function GameProvider({ children }) {
           handshakeComplete = true
           setRoom(msg.payload)
           setWsError(null)
+          setIsDisconnected(false)
           if (!settled) {
             settled = true
             resolve()
@@ -110,7 +115,7 @@ export function GameProvider({ children }) {
 
       ws.onerror = () => {
         if (!handshakeComplete) {
-          rejectConnection('Conexão perdida com o servidor.')
+          rejectConnection(DISCONNECTED_MESSAGE)
         }
       }
 
@@ -122,8 +127,9 @@ export function GameProvider({ children }) {
           rejectConnection('Conexão recusada pelo servidor.')
           return
         }
-        rejectPendingActions('Conexão perdida com o servidor.')
-        setWsError('Conexão perdida com o servidor.')
+        rejectPendingActions(DISCONNECTED_MESSAGE)
+        setIsDisconnected(true)
+        setWsError(DISCONNECTED_MESSAGE)
       }
 
       wsRef.current = ws
@@ -134,6 +140,7 @@ export function GameProvider({ children }) {
     setPlayer(null)
     setRoom(null)
     setWsError(null)
+    setIsDisconnected(false)
     const res = await fetch(`${API_URL}/api/rooms`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -151,6 +158,7 @@ export function GameProvider({ children }) {
     setPlayer(null)
     setRoom(null)
     setWsError(null)
+    setIsDisconnected(false)
     const res = await fetch(`${API_URL}/api/rooms/${code}/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -164,24 +172,38 @@ export function GameProvider({ children }) {
   }
 
   // Reconexão silenciosa (página atualizada, localStorage existente)
-  const reconnect = useCallback(async (roomCode, playerName) => {
-    setPlayer(null)
-    setRoom(null)
+  const reconnect = useCallback(async (roomCode, playerName, options = {}) => {
+    const { preserveState = false } = options
+
+    if (!preserveState) {
+      setPlayer(null)
+      setRoom(null)
+    }
     setWsError(null)
-    const res = await fetch(`${API_URL}/api/rooms/${roomCode}/join`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerName }),
-    })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error)
-    await connectWS(roomCode, playerName)
-    setPlayer(data.player)
+    try {
+      const res = await fetch(`${API_URL}/api/rooms/${roomCode}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerName }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error)
+      await connectWS(roomCode, playerName)
+      setPlayer(data.player)
+      setIsDisconnected(false)
+      return data.player
+    } catch (error) {
+      const reconnectError = error instanceof Error ? error : new Error(DISCONNECTED_MESSAGE)
+      setWsError(reconnectError.message)
+      throw reconnectError
+    }
   }, [connectWS])
 
   const sendWS = useCallback((type, payload) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error('Conexão perdida com o servidor.'))
+      setIsDisconnected(true)
+      setWsError(DISCONNECTED_MESSAGE)
+      return Promise.reject(new Error(DISCONNECTED_MESSAGE))
     }
 
     const requestId = crypto.randomUUID()
@@ -215,6 +237,7 @@ export function GameProvider({ children }) {
         room,
         player,
         wsError,
+        isDisconnected,
         clearError,
         createRoom,
         joinRoom,

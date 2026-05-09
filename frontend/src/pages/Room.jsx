@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useGame, loadSession } from '../context/GameContext.jsx'
 import PixForm from '../components/PixForm.jsx'
@@ -8,33 +8,105 @@ import QRModal from '../components/QRModal.jsx'
 
 export default function Room() {
   const { code } = useParams()
-  const { room, player, wsError, clearError, reconnect } = useGame()
+  const { room, player, wsError, isDisconnected, clearError, reconnect } = useGame()
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState('home')
   const [showQR, setShowQR] = useState(false)
   const [reconnecting, setReconnecting] = useState(false)
+  const [selectedPlayerName, setSelectedPlayerName] = useState('')
+  const [transferToast, setTransferToast] = useState(null)
+
+  const attemptReconnect = useCallback(({ preserveState = false, navigateOnFailure = false } = {}) => {
+    const session = loadSession()
+
+    if (reconnecting) {
+      return Promise.resolve(false)
+    }
+
+    if (!session || session.roomCode !== code) {
+      if (navigateOnFailure) {
+        navigate(`/?code=${code}`, { replace: true })
+      }
+      return Promise.resolve(false)
+    }
+
+    setReconnecting(true)
+    return reconnect(session.roomCode, session.playerName, { preserveState })
+      .then(() => true)
+      .catch(() => {
+        if (navigateOnFailure) {
+          navigate(`/?code=${code}`, { replace: true })
+        }
+        return false
+      })
+      .finally(() => setReconnecting(false))
+  }, [code, navigate, reconnect, reconnecting])
 
   useEffect(() => {
-    if (player) return
+    if (player || reconnecting) return
 
-    const session = loadSession()
-    if (session && session.roomCode === code) {
-      setReconnecting(true)
-      reconnect(session.roomCode, session.playerName)
-        .catch(() => navigate(`/?code=${code}`, { replace: true }))
-        .finally(() => setReconnecting(false))
-    } else {
-      navigate(`/?code=${code}`, { replace: true })
+    attemptReconnect({ navigateOnFailure: true })
+  }, [attemptReconnect, player, reconnecting])
+
+  useEffect(() => {
+    if (!player || !isDisconnected || reconnecting) {
+      return
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (!player || reconnecting) return null
+    const reconnectTimer = window.setTimeout(() => {
+      attemptReconnect({ preserveState: true })
+    }, 1500)
+
+    return () => window.clearTimeout(reconnectTimer)
+  }, [attemptReconnect, isDisconnected, player, reconnecting])
+
+  useEffect(() => {
+    if (!player || !isDisconnected) {
+      return
+    }
+
+    const handleResume = () => {
+      if (document.visibilityState !== 'visible' || reconnecting) {
+        return
+      }
+
+      attemptReconnect({ preserveState: true })
+    }
+
+    document.addEventListener('visibilitychange', handleResume)
+    window.addEventListener('focus', handleResume)
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleResume)
+      window.removeEventListener('focus', handleResume)
+    }
+  }, [attemptReconnect, isDisconnected, player, reconnecting])
+
+  useEffect(() => {
+    if (!transferToast) {
+      return
+    }
+
+    const toastTimer = window.setTimeout(() => {
+      setTransferToast(null)
+    }, 3000)
+
+    return () => window.clearTimeout(toastTimer)
+  }, [transferToast])
+
+  if (!player) return null
 
   const myPlayer = room?.players?.[player.name] ?? player
   const isBanker = myPlayer.isBanker
   const isBankerOnly = isBanker && !myPlayer.isPlayer
   const allPlayers = room ? Object.values(room.players) : []
   const otherPlayers = allPlayers.filter((p) => p.name !== player.name)
+
+  const handlePixSuccess = ({ to, amount }) => {
+    setSelectedPlayerName('')
+    setTransferToast(`Transferência de ${formatBRL(amount)} para ${to} enviada com sucesso.`)
+    setActiveTab('home')
+  }
 
   const tabs = [
     { value: 'home', icon: HomeIcon, label: 'Início' },
@@ -70,6 +142,12 @@ export default function Room() {
         </div>
       )}
 
+      {transferToast && (
+        <div className="mx-4 mb-2 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-sm px-4 py-2.5 rounded-2xl">
+          {transferToast}
+        </div>
+      )}
+
       {/* ── Scrollable Content ───────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto pb-24">
         {activeTab === 'home' && (
@@ -79,9 +157,16 @@ export default function Room() {
             code={code}
             otherPlayers={otherPlayers}
             onShowQR={() => setShowQR(true)}
-            onPixClick={() => setActiveTab('pix')}
+            onPixClick={() => {
+              setSelectedPlayerName('')
+              setActiveTab('pix')
+            }}
             onLogClick={() => setActiveTab('log')}
             onBankClick={() => setActiveTab('bank')}
+            onPlayerSelect={(selectedPlayer) => {
+              setSelectedPlayerName(selectedPlayer.name)
+              setActiveTab('pix')
+            }}
             isBanker={isBanker}
             transactions={room?.transactions ?? []}
           />
@@ -89,7 +174,7 @@ export default function Room() {
         {activeTab === 'pix' && (
           <div className="px-4 pt-2">
             <h2 className="text-xl font-bold text-white mb-4">Enviar Pix</h2>
-            <PixForm players={otherPlayers} />
+            <PixForm players={otherPlayers} selectedPlayerName={selectedPlayerName} onSuccess={handlePixSuccess} />
           </div>
         )}
         {activeTab === 'bank' && isBanker && (
@@ -130,7 +215,7 @@ export default function Room() {
 }
 
 /* ── Home Tab ────────────────────────────────────────────────────────────── */
-function HomeTab({ myPlayer, isBankerOnly, code, otherPlayers, onShowQR, onPixClick, onLogClick, onBankClick, isBanker, transactions }) {
+function HomeTab({ myPlayer, isBankerOnly, code, otherPlayers, onShowQR, onPixClick, onLogClick, onBankClick, onPlayerSelect, isBanker, transactions }) {
   return (
     <div className="px-4 space-y-5 pt-1">
       {isBankerOnly ? (
@@ -153,7 +238,7 @@ function HomeTab({ myPlayer, isBankerOnly, code, otherPlayers, onShowQR, onPixCl
           </div>
           <div className="space-y-2">
             {otherPlayers.map((p) => (
-              <PlayerRow key={p.name} player={p} />
+              <PlayerRow key={p.name} player={p} onClick={onPlayerSelect} />
             ))}
           </div>
         </section>
@@ -253,9 +338,13 @@ function QuickAction({ icon, label, onClick, color }) {
   )
 }
 
-function PlayerRow({ player }) {
+function PlayerRow({ player, onClick }) {
   return (
-    <div className="flex items-center bg-[#141929] rounded-2xl px-4 py-3 border border-white/5">
+    <button
+      type="button"
+      onClick={() => onClick(player)}
+      className="w-full flex items-center bg-[#141929] rounded-2xl px-4 py-3 border border-white/5 text-left transition-colors hover:bg-[#171d31] hover:border-emerald-500/20"
+    >
       <div className="w-9 h-9 rounded-full bg-gradient-to-br from-slate-600 to-slate-700 flex items-center justify-center text-white font-bold text-sm flex-shrink-0">
         {player.name[0].toUpperCase()}
       </div>
@@ -273,7 +362,7 @@ function PlayerRow({ player }) {
         )}
       </div>
       <div className={`w-2 h-2 rounded-full flex-shrink-0 ${player.connected ? 'bg-emerald-400' : 'bg-slate-600'}`} />
-    </div>
+    </button>
   )
 }
 

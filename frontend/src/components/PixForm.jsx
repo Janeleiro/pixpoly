@@ -1,27 +1,37 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useGame } from '../context/GameContext.jsx'
 
-export default function PixForm({ players }) {
+export default function PixForm({ players, selectedPlayerName = '', onSuccess }) {
   const { sendPix } = useGame()
   const [to, setTo] = useState('')
   const [amount, setAmount] = useState('')
   const [localError, setLocalError] = useState(null)
-  const [success, setSuccess] = useState(false)
+
+  useEffect(() => {
+    if (selectedPlayerName) {
+      const hasSelectedPlayer = players.some((player) => player.name === selectedPlayerName)
+      setTo(hasSelectedPlayer ? selectedPlayerName : '')
+      return
+    }
+
+    setTo((currentTo) => (players.some((player) => player.name === currentTo) ? currentTo : ''))
+  }, [players, selectedPlayerName])
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     setLocalError(null)
-    setSuccess(false)
     if (!to) return setLocalError('Selecione um destinatário.')
     const val = parseFloat(amount)
     if (!val || val <= 0) return setLocalError('Informe um valor válido.')
 
     try {
       await sendPix(to, val)
-      setSuccess(true)
       setAmount('')
-      setTo('')
-      setTimeout(() => setSuccess(false), 3000)
+      if (typeof onSuccess === 'function') {
+        onSuccess({ to, amount: val })
+      } else {
+        setTo('')
+      }
     } catch (error) {
       setLocalError(error.message)
     }
@@ -30,7 +40,6 @@ export default function PixForm({ players }) {
   return (
     <div className="space-y-4">
       {localError && <Alert variant="error">{localError}</Alert>}
-      {success && <Alert variant="success">Pix enviado com sucesso ✓</Alert>}
 
       <form onSubmit={handleSubmit} className="space-y-3">
         <Field label="Para">
