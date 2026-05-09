@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pixpoly}
+      POSTGRES_USER: ${POSTGRES_USER:-pixpoly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pixpoly_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - game-network
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-pixpoly}:${POSTGRES_PASSWORD:-pixpoly_secret}@postgres:5432/${POSTGRES_DB:-pixpoly}?sslmode=disable}
+    depends_on:
+      - postgres
+    networks:
+      - game-network
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:3000}
+        VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:3000}
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    networks:
+      - game-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+networks:
+  game-network:
+    driver: bridge
