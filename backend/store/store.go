@@ -2,9 +2,11 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"math/rand"
+	mrand "math/rand"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -41,10 +43,12 @@ func (s *RoomStore) InitSchema(ctx context.Context) error {
 			connected  BOOLEAN       NOT NULL DEFAULT false,
 			pin_hash   VARCHAR(100)  NOT NULL DEFAULT '',
 			active     BOOLEAN       NOT NULL DEFAULT true,
+			session_token VARCHAR(64) NOT NULL DEFAULT '',
 			PRIMARY KEY (room_code, name)
 		);
 		ALTER TABLE players ADD COLUMN IF NOT EXISTS pin_hash VARCHAR(100) NOT NULL DEFAULT '';
 		ALTER TABLE players ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT true;
+		ALTER TABLE players ADD COLUMN IF NOT EXISTS session_token VARCHAR(64) NOT NULL DEFAULT '';
 		CREATE TABLE IF NOT EXISTS transactions (
 			id         VARCHAR(50)   PRIMARY KEY,
 			room_code  VARCHAR(6)    NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,
@@ -143,9 +147,9 @@ func (s *RoomStore) GetPlayer(roomCode, playerName string) (*models.Player, bool
 	ctx := context.Background()
 	p := &models.Player{}
 	err := s.db.QueryRow(ctx,
-		"SELECT name, balance, is_banker, is_player, connected, pin_hash, active FROM players WHERE room_code=$1 AND name=$2",
+		"SELECT name, balance, is_banker, is_player, connected, pin_hash, active, session_token FROM players WHERE room_code=$1 AND name=$2",
 		roomCode, playerName,
-	).Scan(&p.Name, &p.Balance, &p.IsBanker, &p.IsPlayer, &p.Connected, &p.PinHash, &p.Active)
+	).Scan(&p.Name, &p.Balance, &p.IsBanker, &p.IsPlayer, &p.Connected, &p.PinHash, &p.Active, &p.SessionToken)
 	if err != nil {
 		return nil, false
 	}
@@ -172,9 +176,14 @@ func (s *RoomStore) AddPlayer(roomCode, playerName string, isBanker bool, isPlay
 		return nil, fmt.Errorf("erro ao processar PIN")
 	}
 
+	token, err := generateSessionToken()
+	if err != nil {
+		return nil, fmt.Errorf("erro ao processar sessão")
+	}
+
 	_, err = s.db.Exec(ctx,
-		"INSERT INTO players (room_code, name, balance, is_banker, is_player, connected, pin_hash, active) VALUES ($1, $2, $3, $4, $5, true, $6, true)",
-		roomCode, playerName, bal, isBanker, isPlayer, string(pinHash),
+		"INSERT INTO players (room_code, name, balance, is_banker, is_player, connected, pin_hash, active, session_token) VALUES ($1, $2, $3, $4, $5, true, $6, true, $7)",
+		roomCode, playerName, bal, isBanker, isPlayer, string(pinHash), token,
 	)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -184,18 +193,36 @@ func (s *RoomStore) AddPlayer(roomCode, playerName string, isBanker bool, isPlay
 	}
 
 	return &models.Player{
-		Name:      playerName,
-		Balance:   bal,
-		IsBanker:  isBanker,
-		IsPlayer:  isPlayer,
-		Connected: true,
-		Active:    true,
+		Name:         playerName,
+		Balance:      bal,
+		IsBanker:     isBanker,
+		IsPlayer:     isPlayer,
+		Connected:    true,
+		Active:       true,
+		SessionToken: token,
 	}, nil
 }
 
 // VerifyPin checks a plaintext PIN against an already-fetched hash.
 func (s *RoomStore) VerifyPin(pinHash, pin string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(pinHash), []byte(pin)) == nil
+}
+
+// RotateSessionToken issues a fresh WS session token for a player (e.g. on
+// relogin) and invalidates any token issued previously.
+func (s *RoomStore) RotateSessionToken(roomCode, playerName string) (string, error) {
+	token, err := generateSessionToken()
+	if err != nil {
+		return "", fmt.Errorf("erro ao processar sessão")
+	}
+	ctx := context.Background()
+	if _, err := s.db.Exec(ctx,
+		"UPDATE players SET session_token=$1 WHERE room_code=$2 AND name=$3",
+		token, roomCode, playerName,
+	); err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 // SetPlayerActive toggles whether a player can perform actions.
@@ -388,9 +415,19 @@ func generateCode() string {
 	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, 6)
 	for i := range b {
-		b[i] = chars[rand.Intn(len(chars))]
+		b[i] = chars[mrand.Intn(len(chars))]
 	}
 	return string(b)
+}
+
+// generateSessionToken returns a random, unguessable token authorizing WS
+// access for a player session.
+func generateSessionToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 func generateTxID() string {

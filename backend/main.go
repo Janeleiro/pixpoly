@@ -48,16 +48,8 @@ func main() {
 	api := app.Group("/api")
 	api.Post("/rooms", h.CreateRoom)
 	api.Post("/rooms/:code/join", h.JoinRoom)
-	api.Get("/rooms/:code", h.GetRoom)
 
-	app.Use("/ws", func(c *fiber.Ctx) error {
-		if fiberws.IsWebSocketUpgrade(c) {
-			c.Locals("allowed", true)
-			return c.Next()
-		}
-		return fiber.ErrUpgradeRequired
-	})
-
+	app.Use("/ws/:code/:name", h.WSAuthMiddleware)
 	app.Get("/ws/:code/:name", fiberws.New(h.HandleWebSocket))
 
 	port := os.Getenv("PORT")

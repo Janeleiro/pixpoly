@@ -27,23 +27,34 @@ type BroadcastMessage struct {
 	Data     []byte
 }
 
+// personalizedMessage carries a per-recipient payload builder to all clients
+// in a room — used when different clients must not see identical data (e.g.
+// a room's hidden-balance setting means each player only sees their own
+// balance/transactions).
+type personalizedMessage struct {
+	RoomCode string
+	Build    func(viewerName string) []byte
+}
+
 // Hub manages all active WebSocket clients, grouped by room code.
 // All map mutations happen inside the single Run() goroutine — no mutex needed.
 type Hub struct {
-	rooms      map[string]map[*Client]bool
-	names      map[string]map[string]*Client // roomCode -> playerName -> client
-	register   chan *Client
-	unregister chan *Client
-	broadcast  chan *BroadcastMessage
+	rooms        map[string]map[*Client]bool
+	names        map[string]map[string]*Client // roomCode -> playerName -> client
+	register     chan *Client
+	unregister   chan *Client
+	broadcast    chan *BroadcastMessage
+	personalized chan *personalizedMessage
 }
 
 func NewHub() *Hub {
 	return &Hub{
-		rooms:      make(map[string]map[*Client]bool),
-		names:      make(map[string]map[string]*Client),
-		register:   make(chan *Client, 32),
-		unregister: make(chan *Client, 32),
-		broadcast:  make(chan *BroadcastMessage, 256),
+		rooms:        make(map[string]map[*Client]bool),
+		names:        make(map[string]map[string]*Client),
+		register:     make(chan *Client, 32),
+		unregister:   make(chan *Client, 32),
+		broadcast:    make(chan *BroadcastMessage, 256),
+		personalized: make(chan *personalizedMessage, 256),
 	}
 }
 
@@ -124,6 +135,22 @@ func (h *Hub) Run() {
 					}
 				}
 			}
+
+		case msg := <-h.personalized:
+			if clients, ok := h.rooms[msg.RoomCode]; ok {
+				for client := range clients {
+					data := msg.Build(client.name)
+					if data == nil {
+						continue
+					}
+					select {
+					case client.send <- data:
+					default:
+						// Slow client — drop and disconnect.
+						h.removeClient(client)
+					}
+				}
+			}
 		}
 	}
 }
@@ -136,6 +163,13 @@ func (h *Hub) Broadcast(roomCode string, v interface{}) {
 		return
 	}
 	h.broadcast <- &BroadcastMessage{RoomCode: roomCode, Data: data}
+}
+
+// PersonalizedBroadcast calls build once per connected client in the room
+// (from the hub's own goroutine, so it's safe to read shared state) and
+// sends each client only the bytes built for its own player name.
+func (h *Hub) PersonalizedBroadcast(roomCode string, build func(viewerName string) []byte) {
+	h.personalized <- &personalizedMessage{RoomCode: roomCode, Build: build}
 }
 
 // WritePump drains the client's send channel and writes to the WebSocket.

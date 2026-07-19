@@ -10,6 +10,11 @@ type Player struct {
 	Connected bool    `json:"connected"`
 	PinHash   string  `json:"-"`
 	Active    bool    `json:"active"`
+	// SessionToken authorizes a WebSocket connection to act as this player.
+	// Only ever handed to the client that just proved the PIN (in the
+	// CreateRoom/JoinRoom HTTP response) — never serialized into room/state
+	// broadcasts, which every player in the room receives.
+	SessionToken string `json:"-"`
 }
 
 type TransactionType string

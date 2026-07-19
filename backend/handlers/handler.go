@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/url"
@@ -68,6 +69,7 @@ func (h *Handler) CreateRoom(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"code":   room.Code,
 		"player": player,
+		"token":  player.SessionToken,
 	})
 }
 
@@ -98,8 +100,14 @@ func (h *Handler) JoinRoom(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Nome em uso. PIN incorreto."})
 		}
 		// PIN correto: assume a sessão. O WebSocket antigo (se houver) é
-		// desconectado pelo hub quando a nova conexão se registrar.
-		return c.JSON(fiber.Map{"code": code, "player": existing})
+		// desconectado pelo hub quando a nova conexão se registrar. Um novo
+		// token é emitido para que o token anterior (potencialmente exposto
+		// no dispositivo antigo) deixe de autorizar conexões.
+		token, err := h.store.RotateSessionToken(code, req.PlayerName)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "erro ao criar sessão"})
+		}
+		return c.JSON(fiber.Map{"code": code, "player": existing, "token": token})
 	}
 
 	player, err := h.store.AddPlayer(code, req.PlayerName, false, true, req.Pin)
@@ -108,20 +116,35 @@ func (h *Handler) JoinRoom(c *fiber.Ctx) error {
 	}
 
 	h.broadcastState(code)
-	return c.JSON(fiber.Map{"code": code, "player": player})
-}
-
-// GetRoom GET /api/rooms/:code
-func (h *Handler) GetRoom(c *fiber.Ctx) error {
-	code := c.Params("code")
-	room, ok := h.store.GetRoom(code)
-	if !ok {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "sala não encontrada"})
-	}
-	return c.JSON(room)
+	return c.JSON(fiber.Map{"code": code, "player": player, "token": player.SessionToken})
 }
 
 // ── WebSocket Handler ────────────────────────────────────────────────────────
+
+// WSAuthMiddleware verifies the caller presents the session token issued at
+// CreateRoom/JoinRoom time for this exact player before allowing the
+// WebSocket upgrade. Without this, anyone who learns a player's name (e.g.
+// from room-code enumeration) could open /ws/:code/:name directly and the
+// hub would hand them that player's identity — including the banker's.
+func (h *Handler) WSAuthMiddleware(c *fiber.Ctx) error {
+	if !fiberws.IsWebSocketUpgrade(c) {
+		return fiber.ErrUpgradeRequired
+	}
+	code := c.Params("code")
+	name, err := url.PathUnescape(c.Params("name"))
+	if err != nil {
+		name = c.Params("name")
+	}
+	token := c.Query("token")
+
+	player, ok := h.store.GetPlayer(code, name)
+	if !ok || token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(player.SessionToken)) != 1 {
+		return fiber.NewError(fiber.StatusUnauthorized, "sessão inválida")
+	}
+
+	c.Locals("allowed", true)
+	return c.Next()
+}
 
 type wsIncomingMsg struct {
 	RequestID string          `json:"requestId"`
@@ -154,7 +177,8 @@ func (h *Handler) HandleWebSocket(c *fiberws.Conn) {
 
 	// Immediately push the current room state to the new client.
 	if room, ok := h.store.GetRoom(code); ok {
-		if data, err := json.Marshal(models.WSMessage{Type: "state", Payload: room}); err == nil {
+		view := viewForPlayer(room, name)
+		if data, err := json.Marshal(models.WSMessage{Type: "state", Payload: view}); err == nil {
 			select {
 			case client.send <- data:
 			default:
@@ -269,13 +293,59 @@ func (h *Handler) HandleWebSocket(c *fiberws.Conn) {
 	}
 }
 
-// broadcastState fetches the latest room snapshot and broadcasts it to all clients.
+// broadcastState fetches the latest room snapshot and sends each connected
+// client its own view of it (see viewForPlayer) — when the room hides
+// balances, different recipients must not receive identical payloads.
 func (h *Handler) broadcastState(roomCode string) {
 	room, ok := h.store.GetRoom(roomCode)
 	if !ok {
 		return
 	}
-	h.hub.Broadcast(roomCode, models.WSMessage{Type: "state", Payload: room})
+	h.hub.PersonalizedBroadcast(roomCode, func(viewerName string) []byte {
+		view := viewForPlayer(room, viewerName)
+		data, err := json.Marshal(models.WSMessage{Type: "state", Payload: view})
+		if err != nil {
+			log.Printf("broadcastState marshal error: %v", err)
+			return nil
+		}
+		return data
+	})
+}
+
+// viewForPlayer returns the room snapshot as seen by viewerName. When the
+// room's balances are hidden, every other player's balance is stripped and
+// only transactions involving the viewer are kept — except for the banker,
+// who already has full visibility/control over every balance by design.
+func viewForPlayer(room *models.Room, viewerName string) *models.Room {
+	if room.VisibleBalance {
+		return room
+	}
+	if viewer, ok := room.Players[viewerName]; ok && viewer.IsBanker {
+		return room
+	}
+
+	players := make(map[string]*models.Player, len(room.Players))
+	for name, p := range room.Players {
+		if name == viewerName {
+			players[name] = p
+			continue
+		}
+		hidden := *p
+		hidden.Balance = 0
+		players[name] = &hidden
+	}
+
+	transactions := make([]models.Transaction, 0, len(room.Transactions))
+	for _, tx := range room.Transactions {
+		if tx.From == viewerName || tx.To == viewerName {
+			transactions = append(transactions, tx)
+		}
+	}
+
+	view := *room
+	view.Players = players
+	view.Transactions = transactions
+	return &view
 }
 
 func sendErrorTo(client *Client, requestID, message string) {

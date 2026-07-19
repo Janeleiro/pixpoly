@@ -40,7 +40,7 @@ export function GameProvider({ children }) {
     pendingActionsRef.current.clear()
   }, [])
 
-  const connectWS = useCallback((roomCode, playerName) => {
+  const connectWS = useCallback((roomCode, playerName, token) => {
     if (wsRef.current) {
       wsRef.current.onclose = null // prevent old reconnect timers
       wsRef.current.close()
@@ -51,7 +51,9 @@ export function GameProvider({ children }) {
     setIsDisconnected(false)
 
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`${WS_URL}/ws/${roomCode}/${encodeURIComponent(playerName)}`)
+      const ws = new WebSocket(
+        `${WS_URL}/ws/${roomCode}/${encodeURIComponent(playerName)}?token=${encodeURIComponent(token)}`
+      )
       let handshakeComplete = false
       let settled = false
       let kicked = false
@@ -170,7 +172,7 @@ export function GameProvider({ children }) {
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error)
-    await connectWS(data.code, bankerName)
+    await connectWS(data.code, bankerName, data.token)
     setPlayer(data.player)
     saveSession(data.code, bankerName, pin)
     return data.code
@@ -188,7 +190,7 @@ export function GameProvider({ children }) {
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error)
-    await connectWS(code, playerName)
+    await connectWS(code, playerName, data.token)
     setPlayer(data.player)
     saveSession(code, playerName, pin)
   }
@@ -210,7 +212,7 @@ export function GameProvider({ children }) {
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
-      await connectWS(roomCode, playerName)
+      await connectWS(roomCode, playerName, data.token)
       setPlayer(data.player)
       setIsDisconnected(false)
       return data.player
