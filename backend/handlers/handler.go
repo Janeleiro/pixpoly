@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/url"
+	"regexp"
 
 	"github.com/gofiber/fiber/v2"
 	fiberws "github.com/gofiber/websocket/v2"
@@ -11,6 +12,8 @@ import (
 	"pixpoly/models"
 	"pixpoly/store"
 )
+
+var pinRegex = regexp.MustCompile(`^\d{4}$`)
 
 // Handler wires together the HTTP/WS handlers with the store and hub.
 type Handler struct {
@@ -28,6 +31,8 @@ type createRoomRequest struct {
 	BankerName     string  `json:"bankerName"`
 	InitialBalance float64 `json:"initialBalance"`
 	BankerIsPlayer bool    `json:"bankerIsPlayer"`
+	Pin            string  `json:"pin"`
+	VisibleBalance *bool   `json:"visibleBalance"`
 }
 
 // CreateRoom POST /api/rooms
@@ -39,16 +44,23 @@ func (h *Handler) CreateRoom(c *fiber.Ctx) error {
 	if req.BankerName == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "nome do banqueiro obrigatório"})
 	}
+	if !pinRegex.MatchString(req.Pin) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "PIN deve ter 4 dígitos"})
+	}
 	if req.InitialBalance <= 0 {
 		req.InitialBalance = 1500
 	}
+	visibleBalance := true
+	if req.VisibleBalance != nil {
+		visibleBalance = *req.VisibleBalance
+	}
 
-	room, err := h.store.CreateRoom(req.InitialBalance)
+	room, err := h.store.CreateRoom(req.InitialBalance, visibleBalance)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "erro ao criar sala"})
 	}
 
-	player, err := h.store.AddPlayer(room.Code, req.BankerName, true, req.BankerIsPlayer)
+	player, err := h.store.AddPlayer(room.Code, req.BankerName, true, req.BankerIsPlayer, req.Pin)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -61,6 +73,7 @@ func (h *Handler) CreateRoom(c *fiber.Ctx) error {
 
 type joinRoomRequest struct {
 	PlayerName string `json:"playerName"`
+	Pin        string `json:"pin"`
 }
 
 // JoinRoom POST /api/rooms/:code/join
@@ -73,17 +86,24 @@ func (h *Handler) JoinRoom(c *fiber.Ctx) error {
 	if req.PlayerName == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "nome do jogador obrigatório"})
 	}
+	if !pinRegex.MatchString(req.Pin) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "PIN deve ter 4 dígitos"})
+	}
 
-	player, err := h.store.AddPlayer(code, req.PlayerName, false, true)
-	if err != nil {
-		// "nome já em uso" — só permite reconexão se não houver socket ativo no hub
-		if existing, ok := h.store.GetPlayer(code, req.PlayerName); ok {
-			if h.hub.HasActiveClient(code, req.PlayerName) {
-				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "este nome já está em uso por outro dispositivo"})
-			}
-			// Jogador sem socket ativo: permite retomar a sessão
-			return c.JSON(fiber.Map{"code": code, "player": existing})
+	// Nome já em uso: só permite retomar a sessão (relogin) se o PIN bater.
+	// Checa antes de tentar criar, para não gastar hash de PIN e um INSERT
+	// fadado a falhar em toda tentativa de relogin/reconexão.
+	if existing, ok := h.store.GetPlayer(code, req.PlayerName); ok {
+		if !h.store.VerifyPin(existing.PinHash, req.Pin) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Nome em uso. PIN incorreto."})
 		}
+		// PIN correto: assume a sessão. O WebSocket antigo (se houver) é
+		// desconectado pelo hub quando a nova conexão se registrar.
+		return c.JSON(fiber.Map{"code": code, "player": existing})
+	}
+
+	player, err := h.store.AddPlayer(code, req.PlayerName, false, true, req.Pin)
+	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
@@ -105,8 +125,8 @@ func (h *Handler) GetRoom(c *fiber.Ctx) error {
 
 type wsIncomingMsg struct {
 	RequestID string          `json:"requestId"`
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload"`
 }
 
 // HandleWebSocket manages a single WebSocket connection for the given room/player.
@@ -118,20 +138,15 @@ func (h *Handler) HandleWebSocket(c *fiberws.Conn) {
 	}
 
 	client := &Client{
-		conn:     c,
-		roomCode: code,
-		name:     name,
-		send:     make(chan []byte, 256),
-		accepted: make(chan bool, 1),
+		conn:       c,
+		roomCode:   code,
+		name:       name,
+		send:       make(chan []byte, 256),
+		registered: make(chan struct{}),
 	}
 
 	h.hub.register <- client
-
-	if !<-client.accepted {
-		data, _ := json.Marshal(models.WSMessage{Type: "error", Payload: "jogador já conectado em outro dispositivo"})
-		c.WriteMessage(fiberws.TextMessage, data)
-		return
-	}
+	<-client.registered
 
 	// Marca como conectado (cobre reconexão após queda de rede)
 	h.store.SetPlayerConnected(code, name, true)
@@ -149,7 +164,11 @@ func (h *Handler) HandleWebSocket(c *fiberws.Conn) {
 
 	defer func() {
 		h.hub.unregister <- client
-		h.store.SetPlayerConnected(code, name, false)
+		// Se este cliente foi substituído por um relogin, quem manda no estado
+		// "connected" agora é a nova conexão — não sobrescrever para false.
+		if !client.superseded.Load() {
+			h.store.SetPlayerConnected(code, name, false)
+		}
 		h.broadcastState(code)
 	}()
 
@@ -210,6 +229,35 @@ func (h *Handler) HandleWebSocket(c *fiberws.Conn) {
 			}
 			if _, err := h.store.BankDebit(code, name, p.Player, p.Amount); err != nil {
 				sendErrorTo(client, incoming.RequestID, err.Error())
+				continue
+			}
+			sendSuccessTo(client, incoming.RequestID)
+			h.broadcastState(code)
+
+		case "deactivate_player":
+			var p struct {
+				Player string `json:"player"`
+			}
+			if err := json.Unmarshal(incoming.Payload, &p); err != nil {
+				sendErrorTo(client, incoming.RequestID, "payload inválido")
+				continue
+			}
+			requester, ok := h.store.GetPlayer(code, name)
+			if !ok || !requester.IsBanker {
+				sendErrorTo(client, incoming.RequestID, "Apenas o banqueiro pode inativar jogadores")
+				continue
+			}
+			target, ok := h.store.GetPlayer(code, p.Player)
+			if !ok {
+				sendErrorTo(client, incoming.RequestID, "Jogador não encontrado")
+				continue
+			}
+			if target.IsBanker {
+				sendErrorTo(client, incoming.RequestID, "O banqueiro não pode ser inativado")
+				continue
+			}
+			if err := h.store.SetPlayerActive(code, p.Player, false); err != nil {
+				sendErrorTo(client, incoming.RequestID, "erro ao inativar jogador")
 				continue
 			}
 			sendSuccessTo(client, incoming.RequestID)

@@ -3,29 +3,28 @@ package handlers
 import (
 	"encoding/json"
 	"log"
+	"sync/atomic"
+	"time"
 
 	fiberws "github.com/gofiber/websocket/v2"
+
+	"pixpoly/models"
 )
 
 // Client represents a connected WebSocket client.
 type Client struct {
-	conn     *fiberws.Conn
-	roomCode string
-	name     string
-	send     chan []byte
-	accepted chan bool // receives the registration result from the hub
+	conn       *fiberws.Conn
+	roomCode   string
+	name       string
+	send       chan []byte
+	registered chan struct{} // closed by the hub once the client is registered
+	superseded atomic.Bool   // true when a relogin evicted this client
 }
 
 // BroadcastMessage carries a payload to all clients in a room.
 type BroadcastMessage struct {
 	RoomCode string
 	Data     []byte
-}
-
-type activeClientQuery struct {
-	roomCode string
-	name     string
-	result   chan bool
 }
 
 // Hub manages all active WebSocket clients, grouped by room code.
@@ -36,7 +35,6 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	broadcast  chan *BroadcastMessage
-	active     chan activeClientQuery
 }
 
 func NewHub() *Hub {
@@ -46,14 +44,7 @@ func NewHub() *Hub {
 		register:   make(chan *Client, 32),
 		unregister: make(chan *Client, 32),
 		broadcast:  make(chan *BroadcastMessage, 256),
-		active:     make(chan activeClientQuery, 32),
 	}
-}
-
-func (h *Hub) HasActiveClient(roomCode, name string) bool {
-	result := make(chan bool, 1)
-	h.active <- activeClientQuery{roomCode: roomCode, name: name, result: result}
-	return <-result
 }
 
 func (h *Hub) removeClient(client *Client) {
@@ -76,25 +67,48 @@ func (h *Hub) removeClient(client *Client) {
 	}
 }
 
+// roomMaps returns the client/name maps for a room, lazily creating them.
+// Must only be called from the Run() goroutine.
+func (h *Hub) roomMaps(roomCode string) (map[*Client]bool, map[string]*Client) {
+	if _, ok := h.rooms[roomCode]; !ok {
+		h.rooms[roomCode] = make(map[*Client]bool)
+	}
+	if _, ok := h.names[roomCode]; !ok {
+		h.names[roomCode] = make(map[string]*Client)
+	}
+	return h.rooms[roomCode], h.names[roomCode]
+}
+
+// evict kicks an existing client, e.g. because a relogin from another device
+// is taking over the same player. It may empty and remove the room's maps
+// (via removeClient) if the evicted client was the only one connected —
+// callers must fetch/recreate room maps with roomMaps() AFTER calling this.
+func (h *Hub) evict(client *Client) {
+	client.superseded.Store(true)
+	kicked, _ := json.Marshal(models.WSMessage{
+		Type:    "kicked",
+		Payload: "Você foi desconectado porque este usuário entrou em outro dispositivo.",
+	})
+	select {
+	case client.send <- kicked:
+	default:
+	}
+	h.removeClient(client)
+}
+
 // Run is the hub's main event loop. Must be started in its own goroutine.
 func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.register:
-			if _, ok := h.rooms[client.roomCode]; !ok {
-				h.rooms[client.roomCode] = make(map[*Client]bool)
+			if old, ok := h.names[client.roomCode][client.name]; ok {
+				// Relogin: o novo dispositivo assume o jogador; o antigo é desconectado.
+				h.evict(old)
 			}
-			if _, ok := h.names[client.roomCode]; !ok {
-				h.names[client.roomCode] = make(map[string]*Client)
-			}
-			if _, ok := h.names[client.roomCode][client.name]; ok {
-				// Jogador já tem conexão ativa — rejeita a nova
-				client.accepted <- false
-			} else {
-				h.rooms[client.roomCode][client] = true
-				h.names[client.roomCode][client.name] = client
-				client.accepted <- true
-			}
+			clients, names := h.roomMaps(client.roomCode)
+			clients[client] = true
+			names[client.name] = client
+			close(client.registered)
 
 		case client := <-h.unregister:
 			h.removeClient(client)
@@ -110,15 +124,6 @@ func (h *Hub) Run() {
 					}
 				}
 			}
-
-		case query := <-h.active:
-			roomNames, ok := h.names[query.roomCode]
-			if !ok {
-				query.result <- false
-				continue
-			}
-			_, active := roomNames[query.name]
-			query.result <- active
 		}
 	}
 }
@@ -136,7 +141,13 @@ func (h *Hub) Broadcast(roomCode string, v interface{}) {
 // WritePump drains the client's send channel and writes to the WebSocket.
 // Must be run in a dedicated goroutine.
 func (c *Client) WritePump() {
-	defer c.conn.Close()
+	defer func() {
+		// fasthttp's connection doesn't unblock a concurrently-running ReadMessage
+		// (in HandleWebSocket's goroutine) on a plain Close() from here — an expired
+		// read deadline is what actually interrupts it.
+		c.conn.SetReadDeadline(time.Now())
+		c.conn.Close()
+	}()
 	for msg := range c.send {
 		if err := c.conn.WriteMessage(fiberws.TextMessage, msg); err != nil {
 			log.Printf("ws write error [%s/%s]: %v", c.roomCode, c.name, err)

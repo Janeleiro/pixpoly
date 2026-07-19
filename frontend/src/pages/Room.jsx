@@ -1,10 +1,15 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { useGame, loadSession } from '../context/GameContext.jsx'
+import { useGame, loadSession, clearSession } from '../context/GameContext.jsx'
 import PixForm from '../components/PixForm.jsx'
 import BankPanel from '../components/BankPanel.jsx'
 import TransactionLog from '../components/TransactionLog.jsx'
 import QRModal from '../components/QRModal.jsx'
+import ManagePlayersModal from '../components/ManagePlayersModal.jsx'
+import NotificationToasts from '../components/NotificationToasts.jsx'
+
+const TOAST_VISIBLE_MS = 2000
+const TOAST_LEAVE_MS = 300
 
 export default function Room() {
   const { code } = useParams()
@@ -12,9 +17,13 @@ export default function Room() {
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState('home')
   const [showQR, setShowQR] = useState(false)
+  const [showManage, setShowManage] = useState(false)
   const [reconnecting, setReconnecting] = useState(false)
   const [selectedPlayerName, setSelectedPlayerName] = useState('')
   const [transferToast, setTransferToast] = useState(null)
+  const [notifications, setNotifications] = useState([])
+  const seenTxIdsRef = useRef(null)
+  const notificationTimersRef = useRef([])
 
   const attemptReconnect = useCallback(({ preserveState = false, navigateOnFailure = false } = {}) => {
     const session = loadSession()
@@ -23,15 +32,18 @@ export default function Room() {
       return Promise.resolve(false)
     }
 
-    if (!session || session.roomCode !== code) {
+    if (!session || session.roomCode !== code || !/^\d{4}$/.test(session.pin)) {
       if (navigateOnFailure) {
+        // Sessão inexistente ou salva antes do PIN existir/corrompida: não há
+        // como retomar silenciosamente, então limpa para não tentar de novo.
+        clearSession()
         navigate(`/?code=${code}`, { replace: true })
       }
       return Promise.resolve(false)
     }
 
     setReconnecting(true)
-    return reconnect(session.roomCode, session.playerName, { preserveState })
+    return reconnect(session.roomCode, session.playerName, session.pin, { preserveState })
       .then(() => true)
       .catch(() => {
         if (navigateOnFailure) {
@@ -94,13 +106,85 @@ export default function Room() {
     return () => window.clearTimeout(toastTimer)
   }, [transferToast])
 
+  const pushNotification = useCallback((notification) => {
+    const id = crypto.randomUUID()
+    setNotifications((prev) => [...prev, { ...notification, id, leaving: false }])
+
+    const leaveTimer = window.setTimeout(() => {
+      setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, leaving: true } : n)))
+    }, TOAST_VISIBLE_MS)
+
+    const removeTimer = window.setTimeout(() => {
+      setNotifications((prev) => prev.filter((n) => n.id !== id))
+      notificationTimersRef.current = notificationTimersRef.current.filter(
+        (t) => t !== leaveTimer && t !== removeTimer
+      )
+    }, TOAST_VISIBLE_MS + TOAST_LEAVE_MS)
+
+    notificationTimersRef.current.push(leaveTimer, removeTimer)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      notificationTimersRef.current.forEach(window.clearTimeout)
+    }
+  }, [])
+
+  // Detecta transações novas (pix recebido / afetado por operação do banco) e
+  // dispara um "toast" — só a partir da segunda atualização, para não notificar
+  // o histórico inteiro no primeiro carregamento/reconexão.
+  useEffect(() => {
+    const transactions = room?.transactions
+    if (!transactions || !player) return
+
+    if (seenTxIdsRef.current === null) {
+      seenTxIdsRef.current = new Set(transactions.map((tx) => tx.id))
+      return
+    }
+
+    const myName = player.name
+    for (const tx of transactions) {
+      if (seenTxIdsRef.current.has(tx.id)) continue
+      seenTxIdsRef.current.add(tx.id)
+
+      if (tx.type === 'pix' && tx.to === myName && tx.from !== myName) {
+        pushNotification({
+          kind: 'pix',
+          title: 'Pix recebido',
+          message: `${tx.from} enviou ${formatBRL(tx.amount)} para você.`,
+        })
+      } else if (tx.type === 'bank_credit' && tx.to === myName) {
+        pushNotification({
+          kind: 'bank_credit',
+          title: 'Crédito do banco',
+          message: `Você recebeu ${formatBRL(tx.amount)} do banco.`,
+        })
+      } else if (tx.type === 'bank_debit' && tx.from === myName) {
+        pushNotification({
+          kind: 'bank_debit',
+          title: 'Débito do banco',
+          message: `O banco debitou ${formatBRL(tx.amount)} da sua conta.`,
+        })
+      }
+    }
+  }, [room?.transactions, player, pushNotification])
+
   if (!player) return null
 
   const myPlayer = room?.players?.[player.name] ?? player
   const isBanker = myPlayer.isBanker
   const isBankerOnly = isBanker && !myPlayer.isPlayer
+  const myActive = myPlayer.active !== false
+  const visibleBalance = room?.visibleBalance !== false
   const allPlayers = room ? Object.values(room.players) : []
   const otherPlayers = allPlayers.filter((p) => p.name !== player.name)
+  const visibleOtherPlayers = otherPlayers.filter((p) => p.active !== false)
+  const pixTargets = visibleOtherPlayers.filter((p) => p.isPlayer)
+  const bankTargets = allPlayers.filter((p) => p.isPlayer && p.active !== false)
+  const manageablePlayers = otherPlayers
+  const homeTransactions = visibleBalance
+    ? room?.transactions ?? []
+    : (room?.transactions ?? []).filter((tx) => tx.from === myPlayer.name || tx.to === myPlayer.name)
 
   const handlePixSuccess = ({ to, amount }) => {
     setSelectedPlayerName('')
@@ -110,14 +194,18 @@ export default function Room() {
 
   const tabs = [
     { value: 'home', icon: HomeIcon, label: 'Início' },
-    { value: 'pix', icon: PixIcon, label: 'Pix' },
+    ...(isBankerOnly ? [] : [{ value: 'pix', icon: PixIcon, label: 'Pix' }]),
     ...(isBanker ? [{ value: 'bank', icon: BankIcon, label: 'Banco' }] : []),
     { value: 'log', icon: LogIcon, label: 'Extrato' },
   ]
 
   return (
     <div className="min-h-screen bg-[#0a0e1a] flex flex-col max-w-lg mx-auto relative">
+      <NotificationToasts toasts={notifications} />
       {showQR && <QRModal roomCode={code} onClose={() => setShowQR(false)} />}
+      {showManage && (
+        <ManagePlayersModal players={manageablePlayers} onClose={() => setShowManage(false)} />
+      )}
 
       {/* ── Header ─────────────────────────────────────────────────── */}
       <header className="flex items-center justify-between px-4 pt-5 pb-3 flex-shrink-0">
@@ -131,8 +219,23 @@ export default function Room() {
               Banqueiro
             </span>
           )}
+          {isBanker && (
+            <button
+              onClick={() => setShowManage(true)}
+              className="w-8 h-8 flex items-center justify-center rounded-full bg-white/5 hover:bg-white/10 text-slate-300 transition-colors"
+              title="Gerenciar jogadores"
+            >
+              <UsersIcon />
+            </button>
+          )}
         </div>
       </header>
+
+      {!myActive && (
+        <div className="mx-4 mb-2 bg-amber-500/10 border border-amber-500/20 text-amber-400 text-sm px-4 py-2.5 rounded-2xl">
+          Sua conta foi inativada pelo banqueiro. Você pode visualizar a sala, mas não pode realizar transferências.
+        </div>
+      )}
 
       {/* ── Error Toast ──────────────────────────────────────────────── */}
       {wsError && (
@@ -155,7 +258,7 @@ export default function Room() {
             myPlayer={myPlayer}
             isBankerOnly={isBankerOnly}
             code={code}
-            otherPlayers={otherPlayers}
+            otherPlayers={visibleOtherPlayers}
             onShowQR={() => setShowQR(true)}
             onPixClick={() => {
               setSelectedPlayerName('')
@@ -165,28 +268,40 @@ export default function Room() {
             onBankClick={() => setActiveTab('bank')}
             onPlayerSelect={(selectedPlayer) => {
               setSelectedPlayerName(selectedPlayer.name)
-              setActiveTab('pix')
+              setActiveTab(isBankerOnly ? 'bank' : 'pix')
             }}
             isBanker={isBanker}
-            transactions={room?.transactions ?? []}
+            transactions={homeTransactions}
+            visibleBalance={visibleBalance}
           />
         )}
-        {activeTab === 'pix' && (
+        {activeTab === 'pix' && !isBankerOnly && (
           <div className="px-4 pt-2">
             <h2 className="text-xl font-bold text-white mb-4">Enviar Pix</h2>
-            <PixForm players={otherPlayers} selectedPlayerName={selectedPlayerName} onSuccess={handlePixSuccess} />
+            <PixForm
+              players={pixTargets}
+              selectedPlayerName={selectedPlayerName}
+              onSuccess={handlePixSuccess}
+              disabled={!myActive}
+            />
           </div>
         )}
         {activeTab === 'bank' && isBanker && (
           <div className="px-4 pt-2">
             <h2 className="text-xl font-bold text-amber-400 mb-4">Painel do Banco</h2>
-            <BankPanel players={allPlayers} />
+            <BankPanel players={bankTargets} selectedPlayerName={selectedPlayerName} disabled={!myActive} />
           </div>
         )}
         {activeTab === 'log' && (
           <div className="px-4 pt-2">
             <h2 className="text-xl font-bold text-white mb-4">Extrato</h2>
-            <TransactionLog transactions={room?.transactions ?? []} />
+            <TransactionLog
+              transactions={room?.transactions ?? []}
+              myName={myPlayer.name}
+              isBanker={isBanker}
+              isBankerOnly={isBankerOnly}
+              visibleBalance={visibleBalance}
+            />
           </div>
         )}
       </div>
@@ -215,7 +330,7 @@ export default function Room() {
 }
 
 /* ── Home Tab ────────────────────────────────────────────────────────────── */
-function HomeTab({ myPlayer, isBankerOnly, code, otherPlayers, onShowQR, onPixClick, onLogClick, onBankClick, onPlayerSelect, isBanker, transactions }) {
+function HomeTab({ myPlayer, isBankerOnly, code, otherPlayers, onShowQR, onPixClick, onLogClick, onBankClick, onPlayerSelect, isBanker, transactions, visibleBalance }) {
   return (
     <div className="px-4 space-y-5 pt-1">
       {isBankerOnly ? (
@@ -224,8 +339,8 @@ function HomeTab({ myPlayer, isBankerOnly, code, otherPlayers, onShowQR, onPixCl
         <BalanceCard myPlayer={myPlayer} code={code} onShowQR={onShowQR} />
       )}
 
-      <div className={`grid gap-3 ${isBanker ? 'grid-cols-3' : 'grid-cols-2'}`}>
-        <QuickAction icon={<PixIcon active />} label="Pix" onClick={onPixClick} color="emerald" />
+      <div className={`grid gap-3 ${isBankerOnly ? 'grid-cols-2' : isBanker ? 'grid-cols-3' : 'grid-cols-2'}`}>
+        {!isBankerOnly && <QuickAction icon={<PixIcon active />} label="Pix" onClick={onPixClick} color="emerald" />}
         {isBanker && <QuickAction icon={<BankIcon active />} label="Banco" onClick={onBankClick} color="amber" />}
         <QuickAction icon={<LogIcon active />} label="Extrato" onClick={onLogClick} color="blue" />
       </div>
@@ -237,9 +352,18 @@ function HomeTab({ myPlayer, isBankerOnly, code, otherPlayers, onShowQR, onPixCl
             <span className="text-xs text-slate-500">{otherPlayers.length + 1} na sala</span>
           </div>
           <div className="space-y-2">
-            {otherPlayers.map((p) => (
-              <PlayerRow key={p.name} player={p} onClick={onPlayerSelect} />
-            ))}
+            {otherPlayers.map((p) => {
+              const isBankerRowOnly = p.isBanker && !p.isPlayer
+              return (
+                <PlayerRow
+                  key={p.name}
+                  player={p}
+                  onClick={isBankerRowOnly ? undefined : onPlayerSelect}
+                  disabled={isBankerRowOnly}
+                  hideBalance={!visibleBalance}
+                />
+              )
+            })}
           </div>
         </section>
       )}
@@ -338,12 +462,15 @@ function QuickAction({ icon, label, onClick, color }) {
   )
 }
 
-function PlayerRow({ player, onClick }) {
+function PlayerRow({ player, onClick, disabled = false, hideBalance = false }) {
   return (
     <button
       type="button"
-      onClick={() => onClick(player)}
-      className="w-full flex items-center bg-[#141929] rounded-2xl px-4 py-3 border border-white/5 text-left transition-colors hover:bg-[#171d31] hover:border-emerald-500/20"
+      disabled={disabled}
+      onClick={disabled ? undefined : () => onClick(player)}
+      className={`w-full flex items-center bg-[#141929] rounded-2xl px-4 py-3 border border-white/5 text-left transition-colors ${
+        disabled ? 'opacity-60 cursor-default' : 'hover:bg-[#171d31] hover:border-emerald-500/20'
+      }`}
     >
       <div className="w-9 h-9 rounded-full bg-gradient-to-br from-slate-600 to-slate-700 flex items-center justify-center text-white font-bold text-sm flex-shrink-0">
         {player.name[0].toUpperCase()}
@@ -354,9 +481,11 @@ function PlayerRow({ player, onClick }) {
           {player.isBanker && <span className="text-amber-400 text-xs">★</span>}
         </div>
         {player.isPlayer ? (
-          <p className="text-emerald-400 text-xs font-medium tabular-nums mt-0.5">
-            {formatBRL(player.balance)}
-          </p>
+          hideBalance ? null : (
+            <p className="text-emerald-400 text-xs font-medium tabular-nums mt-0.5">
+              {formatBRL(player.balance)}
+            </p>
+          )
         ) : (
           <p className="text-amber-400 text-xs font-medium mt-0.5">Banqueiro</p>
         )}
@@ -435,6 +564,16 @@ function QrIcon() {
     <svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
       <rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="3" y="14" width="7" height="7" />
       <path d="M14 14h3v3M17 21h4M21 17h-4" />
+    </svg>
+  )
+}
+
+function UsersIcon() {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M17 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
     </svg>
   )
 }

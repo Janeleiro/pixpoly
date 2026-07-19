@@ -8,6 +8,8 @@ type Player struct {
 	IsBanker  bool    `json:"isBanker"`
 	IsPlayer  bool    `json:"isPlayer"`
 	Connected bool    `json:"connected"`
+	PinHash   string  `json:"-"`
+	Active    bool    `json:"active"`
 }
 
 type TransactionType string
@@ -32,11 +34,12 @@ type Room struct {
 	Players        map[string]*Player `json:"players"`
 	Transactions   []Transaction      `json:"transactions"`
 	InitialBalance float64            `json:"initialBalance"`
+	VisibleBalance bool               `json:"visibleBalance"`
 }
 
 // WSMessage is the envelope sent over WebSocket.
 type WSMessage struct {
 	RequestID string      `json:"requestId,omitempty"`
-	Type    string      `json:"type"`
-	Payload interface{} `json:"payload"`
+	Type      string      `json:"type"`
+	Payload   interface{} `json:"payload"`
 }

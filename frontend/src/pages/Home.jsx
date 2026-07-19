@@ -2,18 +2,23 @@ import { useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useGame } from '../context/GameContext.jsx'
 
+const digitsOnly = (value) => value.replace(/\D/g, '')
+
 export default function Home() {
-  const { createRoom, joinRoom } = useGame()
+  const { createRoom, joinRoom, wsError } = useGame()
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
 
   const preCode = searchParams.get('code') || ''
   const [tab, setTab] = useState(preCode ? 'join' : 'create')
   const [bankerName, setBankerName] = useState('')
-  const [initialBalance, setInitialBalance] = useState(1500)
+  const [bankerPin, setBankerPin] = useState('')
+  const [initialBalance, setInitialBalance] = useState('1500')
   const [bankerIsPlayer, setBankerIsPlayer] = useState(true)
+  const [visibleBalance, setVisibleBalance] = useState(true)
   const [joinCode, setJoinCode] = useState(preCode)
   const [joinName, setJoinName] = useState('')
+  const [joinPin, setJoinPin] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
@@ -22,7 +27,9 @@ export default function Home() {
     setLoading(true)
     setError(null)
     try {
-      const code = await createRoom(bankerName.trim(), Number(initialBalance), bankerIsPlayer)
+      if (bankerPin.length !== 4) throw new Error('O PIN deve ter 4 dígitos.')
+      if (!initialBalance || Number(initialBalance) < 1) throw new Error('Informe um saldo inicial válido.')
+      const code = await createRoom(bankerName.trim(), Number(initialBalance), bankerIsPlayer, bankerPin, visibleBalance)
       navigate(`/room/${code}`)
     } catch (err) {
       setError(err.message)
@@ -36,8 +43,9 @@ export default function Home() {
     setLoading(true)
     setError(null)
     try {
+      if (joinPin.length !== 4) throw new Error('O PIN deve ter 4 dígitos.')
       const code = joinCode.trim().toUpperCase()
-      await joinRoom(code, joinName.trim())
+      await joinRoom(code, joinName.trim(), joinPin)
       navigate(`/room/${code}`)
     } catch (err) {
       setError(err.message)
@@ -59,9 +67,9 @@ export default function Home() {
         </div>
 
         {/* Error banner */}
-        {error && (
+        {(error || wsError) && (
           <div className="bg-red-500/10 border border-red-500/30 text-red-400 rounded-2xl p-3 mb-4 text-sm text-center">
-            {error}
+            {error || wsError}
           </div>
         )}
 
@@ -101,33 +109,36 @@ export default function Home() {
                     className={inputClass}
                   />
                 </Field>
+                <PinField
+                  label="Crie um PIN de 4 dígitos"
+                  value={bankerPin}
+                  onChange={(value) => setBankerPin(value)}
+                />
                 <Field label="Saldo inicial (R$)">
                   <input
-                    type="number"
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
                     value={initialBalance}
-                    onChange={(e) => setInitialBalance(e.target.value)}
-                    min="1"
+                    onChange={(e) => setInitialBalance(digitsOnly(e.target.value))}
                     required
                     className={inputClass}
                   />
                 </Field>
 
-                {/* Toggle: também será jogador */}
-                <button
-                  type="button"
-                  onClick={() => setBankerIsPlayer((v) => !v)}
-                  className="w-full flex items-center justify-between bg-white/5 hover:bg-white/8 rounded-xl px-4 py-3 transition-colors"
-                >
-                  <div className="text-left">
-                    <p className="text-sm font-medium text-white">Participar como jogador</p>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      {bankerIsPlayer ? 'Você terá saldo e poderá enviar Pix' : 'Apenas gerencia o banco'}
-                    </p>
-                  </div>
-                  <div className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 relative ${bankerIsPlayer ? 'bg-emerald-500' : 'bg-slate-600'}`}>
-                    <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${bankerIsPlayer ? 'translate-x-5' : 'translate-x-0.5'}`} />
-                  </div>
-                </button>
+                <ToggleField
+                  label="Participar como jogador"
+                  description={bankerIsPlayer ? 'Você terá saldo e poderá enviar Pix' : 'Apenas gerencia o banco'}
+                  checked={bankerIsPlayer}
+                  onToggle={() => setBankerIsPlayer((v) => !v)}
+                />
+
+                <ToggleField
+                  label="Saldo visível"
+                  description={visibleBalance ? 'Todos veem o saldo e o extrato de todos' : 'Cada jogador só vê o próprio saldo e extrato'}
+                  checked={visibleBalance}
+                  onToggle={() => setVisibleBalance((v) => !v)}
+                />
 
                 <SubmitBtn loading={loading} label="Criar Sala" loadingLabel="Criando..." />
               </form>
@@ -155,6 +166,14 @@ export default function Home() {
                     className={inputClass}
                   />
                 </Field>
+                <PinField
+                  label="Seu PIN de 4 dígitos"
+                  value={joinPin}
+                  onChange={(value) => setJoinPin(value)}
+                />
+                <p className="text-xs text-slate-500 -mt-2">
+                  Já jogou nesta sala? Use o mesmo nome e PIN para retomar sua conta (o dispositivo antigo será desconectado).
+                </p>
                 <SubmitBtn loading={loading} label="Entrar na Sala" loadingLabel="Entrando..." />
               </form>
             )}
@@ -167,6 +186,44 @@ export default function Home() {
 
 const inputClass =
   'w-full bg-white/5 border border-white/10 text-white placeholder-slate-500 rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent transition'
+
+function PinField({ label, value, onChange }) {
+  return (
+    <Field label={label}>
+      <input
+        type="text"
+        inputMode="numeric"
+        pattern="[0-9]*"
+        autoComplete="off"
+        value={value}
+        onChange={(e) => onChange(digitsOnly(e.target.value).slice(0, 4))}
+        placeholder="••••"
+        maxLength={4}
+        required
+        style={{ WebkitTextSecurity: 'disc', textSecurity: 'disc' }}
+        className={`${inputClass} text-center tracking-[0.5em]`}
+      />
+    </Field>
+  )
+}
+
+function ToggleField({ label, description, checked, onToggle }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="w-full flex items-center justify-between bg-white/5 hover:bg-white/8 rounded-xl px-4 py-3 transition-colors"
+    >
+      <div className="text-left">
+        <p className="text-sm font-medium text-white">{label}</p>
+        <p className="text-xs text-slate-400 mt-0.5">{description}</p>
+      </div>
+      <div className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 relative ${checked ? 'bg-emerald-500' : 'bg-slate-600'}`}>
+        <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${checked ? 'translate-x-5' : 'translate-x-0.5'}`} />
+      </div>
+    </button>
+  )
+}
 
 function Field({ label, children }) {
   return (

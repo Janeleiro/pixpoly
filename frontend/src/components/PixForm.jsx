@@ -1,29 +1,38 @@
 import { useEffect, useState } from 'react'
 import { useGame } from '../context/GameContext.jsx'
 
-export default function PixForm({ players, selectedPlayerName = '', onSuccess }) {
+export default function PixForm({ players, selectedPlayerName = '', onSuccess, disabled = false }) {
   const { sendPix } = useGame()
   const [to, setTo] = useState('')
   const [amount, setAmount] = useState('')
   const [localError, setLocalError] = useState(null)
+  const [submitting, setSubmitting] = useState(false)
 
+  // Aplica uma seleção nova vinda do pai (ex: toque num jogador na Home) uma
+  // única vez, só quando `selectedPlayerName` muda — não a cada re-render —
+  // para não sobrescrever uma troca manual no <select> quando `players`
+  // ganha uma referência nova por causa de um broadcast qualquer da sala.
   useEffect(() => {
-    if (selectedPlayerName) {
-      const hasSelectedPlayer = players.some((player) => player.name === selectedPlayerName)
-      setTo(hasSelectedPlayer ? selectedPlayerName : '')
-      return
-    }
+    if (!selectedPlayerName) return
+    const hasSelectedPlayer = players.some((player) => player.name === selectedPlayerName)
+    setTo(hasSelectedPlayer ? selectedPlayerName : '')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPlayerName])
 
-    setTo((currentTo) => (players.some((player) => player.name === currentTo) ? currentTo : ''))
-  }, [players, selectedPlayerName])
+  // Se o jogador selecionado sumir da lista (ex: foi inativado), limpa a seleção.
+  useEffect(() => {
+    setTo((currentTo) => (currentTo && !players.some((player) => player.name === currentTo) ? '' : currentTo))
+  }, [players])
 
   const handleSubmit = async (e) => {
     e.preventDefault()
+    if (submitting) return
     setLocalError(null)
     if (!to) return setLocalError('Selecione um destinatário.')
     const val = parseFloat(amount)
     if (!val || val <= 0) return setLocalError('Informe um valor válido.')
 
+    setSubmitting(true)
     try {
       await sendPix(to, val)
       setAmount('')
@@ -34,7 +43,17 @@ export default function PixForm({ players, selectedPlayerName = '', onSuccess })
       }
     } catch (error) {
       setLocalError(error.message)
+    } finally {
+      setSubmitting(false)
     }
+  }
+
+  if (disabled) {
+    return (
+      <Alert variant="error">
+        Sua conta foi inativada pelo banqueiro. Você não pode enviar Pix.
+      </Alert>
+    )
   }
 
   return (
@@ -55,21 +74,23 @@ export default function PixForm({ players, selectedPlayerName = '', onSuccess })
 
         <Field label="Valor (R$)">
           <input
-            type="number"
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
             value={amount}
-            onChange={(e) => setAmount(e.target.value)}
-            placeholder="0,00"
-            min="1"
-            step="1"
+            onChange={(e) => setAmount(e.target.value.replace(/\D/g, ''))}
+            placeholder="0"
             className={inputClass}
           />
         </Field>
 
         <button
           type="submit"
-          className="w-full bg-emerald-500 hover:bg-emerald-400 text-white font-bold py-4 rounded-2xl transition-colors shadow-lg shadow-emerald-500/20 mt-1"
+          disabled={submitting}
+          className="w-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold py-4 rounded-2xl transition-colors shadow-lg shadow-emerald-500/20 mt-1 flex items-center justify-center gap-2"
         >
-          Enviar Pix
+          {submitting && <Spinner />}
+          {submitting ? 'Enviando...' : 'Enviar Pix'}
         </button>
       </form>
     </div>
@@ -101,5 +122,14 @@ function Alert({ variant, children }) {
     <div className={`border rounded-2xl p-3 text-sm ${styles[variant]}`}>
       {children}
     </div>
+  )
+}
+
+function Spinner() {
+  return (
+    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
   )
 }

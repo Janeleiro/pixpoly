@@ -1,22 +1,41 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useGame } from '../context/GameContext.jsx'
 
-export default function BankPanel({ players }) {
+export default function BankPanel({ players, selectedPlayerName = '', disabled = false }) {
   const { bankCredit, bankDebit } = useGame()
   const [op, setOp] = useState('credit')
   const [targetPlayer, setTargetPlayer] = useState('')
   const [amount, setAmount] = useState('')
   const [localError, setLocalError] = useState(null)
   const [success, setSuccess] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  // Aplica uma seleção nova vinda do pai (ex: toque num jogador na Home) uma
+  // única vez, só quando `selectedPlayerName` muda — não a cada re-render —
+  // para não sobrescrever uma troca manual no <select> quando `players`
+  // ganha uma referência nova por causa de um broadcast qualquer da sala.
+  useEffect(() => {
+    if (!selectedPlayerName) return
+    const hasSelectedPlayer = players.some((player) => player.name === selectedPlayerName)
+    setTargetPlayer(hasSelectedPlayer ? selectedPlayerName : '')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPlayerName])
+
+  // Se o jogador selecionado sumir da lista (ex: foi inativado), limpa a seleção.
+  useEffect(() => {
+    setTargetPlayer((current) => (current && !players.some((player) => player.name === current) ? '' : current))
+  }, [players])
 
   const handleSubmit = async (e) => {
     e.preventDefault()
+    if (submitting) return
     setLocalError(null)
     setSuccess('')
     if (!targetPlayer) return setLocalError('Selecione um jogador.')
     const val = parseFloat(amount)
     if (!val || val <= 0) return setLocalError('Informe um valor válido.')
 
+    setSubmitting(true)
     try {
       if (op === 'credit') {
         await bankCredit(targetPlayer, val)
@@ -30,7 +49,17 @@ export default function BankPanel({ players }) {
       setTimeout(() => setSuccess(''), 3000)
     } catch (error) {
       setLocalError(error.message)
+    } finally {
+      setSubmitting(false)
     }
+  }
+
+  if (disabled) {
+    return (
+      <Alert variant="error">
+        Sua conta foi inativada pelo banqueiro. Você não pode realizar operações bancárias.
+      </Alert>
+    )
   }
 
   return (
@@ -61,25 +90,27 @@ export default function BankPanel({ players }) {
 
         <Field label="Valor (R$)">
           <input
-            type="number"
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
             value={amount}
-            onChange={(e) => setAmount(e.target.value)}
-            placeholder="0,00"
-            min="1"
-            step="1"
+            onChange={(e) => setAmount(e.target.value.replace(/\D/g, ''))}
+            placeholder="0"
             className={inputClass}
           />
         </Field>
 
         <button
           type="submit"
-          className={`w-full font-bold py-4 rounded-2xl transition-colors text-white shadow-lg mt-1 ${
+          disabled={submitting}
+          className={`w-full font-bold py-4 rounded-2xl transition-colors text-white shadow-lg mt-1 flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed ${
             op === 'credit'
               ? 'bg-emerald-500 hover:bg-emerald-400 shadow-emerald-500/20'
               : 'bg-red-500 hover:bg-red-400 shadow-red-500/20'
           }`}
         >
-          {op === 'credit' ? 'Creditar Jogador' : 'Debitar Jogador'}
+          {submitting && <Spinner />}
+          {submitting ? 'Enviando...' : op === 'credit' ? 'Creditar Jogador' : 'Debitar Jogador'}
         </button>
       </form>
     </div>
@@ -131,5 +162,14 @@ function Alert({ variant, children }) {
     <div className={`border rounded-2xl p-3 text-sm ${styles[variant]}`}>
       {children}
     </div>
+  )
+}
+
+function Spinner() {
+  return (
+    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
   )
 }

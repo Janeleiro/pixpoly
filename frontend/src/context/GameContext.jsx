@@ -8,8 +8,8 @@ export const DISCONNECTED_MESSAGE = 'Conexão perdida com o servidor.'
 
 const SESSION_KEY = 'pixpoly_session'
 
-export function saveSession(roomCode, playerName) {
-  localStorage.setItem(SESSION_KEY, JSON.stringify({ roomCode, playerName }))
+export function saveSession(roomCode, playerName, pin) {
+  localStorage.setItem(SESSION_KEY, JSON.stringify({ roomCode, playerName, pin }))
 }
 
 export function clearSession() {
@@ -54,6 +54,7 @@ export function GameProvider({ children }) {
       const ws = new WebSocket(`${WS_URL}/ws/${roomCode}/${encodeURIComponent(playerName)}`)
       let handshakeComplete = false
       let settled = false
+      let kicked = false
 
       const rejectConnection = (message) => {
         if (settled) {
@@ -85,6 +86,24 @@ export function GameProvider({ children }) {
             settled = true
             resolve()
           }
+          return
+        }
+
+        if (msg.type === 'kicked') {
+          handshakeComplete = true
+          kicked = true
+          ws.close()
+          if (wsRef.current !== ws) {
+            // Esta conexão já foi substituída por uma mais nova deste mesmo
+            // dispositivo (ex: reconexão própria) — a mensagem é sobre a
+            // conexão antiga, não sobre a sessão atual. Ignorar.
+            return
+          }
+          clearSession()
+          rejectPendingActions(msg.payload || DISCONNECTED_MESSAGE)
+          setRoom(null)
+          setPlayer(null)
+          setWsError(msg.payload || 'Você foi desconectado porque este usuário entrou em outro dispositivo.')
           return
         }
 
@@ -123,6 +142,9 @@ export function GameProvider({ children }) {
         if (wsRef.current === ws) {
           wsRef.current = null
         }
+        if (kicked) {
+          return
+        }
         if (!handshakeComplete) {
           rejectConnection('Conexão recusada pelo servidor.')
           return
@@ -136,7 +158,7 @@ export function GameProvider({ children }) {
     })
   }, [rejectPendingActions])
 
-  const createRoom = async (bankerName, initialBalance, bankerIsPlayer) => {
+  const createRoom = async (bankerName, initialBalance, bankerIsPlayer, pin, visibleBalance) => {
     setPlayer(null)
     setRoom(null)
     setWsError(null)
@@ -144,17 +166,17 @@ export function GameProvider({ children }) {
     const res = await fetch(`${API_URL}/api/rooms`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bankerName, initialBalance, bankerIsPlayer }),
+      body: JSON.stringify({ bankerName, initialBalance, bankerIsPlayer, pin, visibleBalance }),
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error)
     await connectWS(data.code, bankerName)
     setPlayer(data.player)
-    saveSession(data.code, bankerName)
+    saveSession(data.code, bankerName, pin)
     return data.code
   }
 
-  const joinRoom = async (code, playerName) => {
+  const joinRoom = async (code, playerName, pin) => {
     setPlayer(null)
     setRoom(null)
     setWsError(null)
@@ -162,17 +184,17 @@ export function GameProvider({ children }) {
     const res = await fetch(`${API_URL}/api/rooms/${code}/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ playerName }),
+      body: JSON.stringify({ playerName, pin }),
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error)
     await connectWS(code, playerName)
     setPlayer(data.player)
-    saveSession(code, playerName)
+    saveSession(code, playerName, pin)
   }
 
   // Reconexão silenciosa (página atualizada, localStorage existente)
-  const reconnect = useCallback(async (roomCode, playerName, options = {}) => {
+  const reconnect = useCallback(async (roomCode, playerName, pin, options = {}) => {
     const { preserveState = false } = options
 
     if (!preserveState) {
@@ -184,7 +206,7 @@ export function GameProvider({ children }) {
       const res = await fetch(`${API_URL}/api/rooms/${roomCode}/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerName }),
+        body: JSON.stringify({ playerName, pin }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
@@ -229,6 +251,9 @@ export function GameProvider({ children }) {
   const bankDebit = (targetPlayer, amount) =>
     sendWS('bank_debit', { player: targetPlayer, amount })
 
+  const deactivatePlayer = (targetPlayer) =>
+    sendWS('deactivate_player', { player: targetPlayer })
+
   const clearError = () => setWsError(null)
 
   return (
@@ -245,6 +270,7 @@ export function GameProvider({ children }) {
         sendPix,
         bankCredit,
         bankDebit,
+        deactivatePlayer,
       }}
     >
       {children}
